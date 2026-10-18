@@ -1,0 +1,346 @@
+// PHP proxy example: https://gist.github.com/arenagroove/ec98806b34b7d523118d5f439b82691a
+const CONFIG = {
+  proxyUrl: "https://lessrain.com/dev/codepen/codepen-proxy.php",
+  collectionId: "vOBVrG",
+  perPage: 6
+};
+
+const dom = {
+  form: document.querySelector("#collection_form"),
+  collectionId: document.querySelector("#collection_id"),
+  proxyUrl: document.querySelector("#proxy_url"),
+  load: document.querySelector("#load_button"),
+  status: document.querySelector("#request_status"),
+  count: document.querySelector("#result_count"),
+  error: document.querySelector("#request_error"),
+  title: document.querySelector("#collection_title"),
+  description: document.querySelector("#collection_description"),
+  collectionLink: document.querySelector("#collection_link"),
+  sort: document.querySelector("#sort_order"),
+  pageSize: document.querySelector("#page_size"),
+  pens: document.querySelector("#pen_list"),
+  empty: document.querySelector("#empty_message"),
+  pagination: document.querySelector("#pagination"),
+  previous: document.querySelector("#previous_page"),
+  next: document.querySelector("#next_page"),
+  pageStatus: document.querySelector("#page_status"),
+  source: document.querySelector("#json_output")
+};
+
+let currentSettings = null;
+let currentCollection = null;
+let currentPage = 1;
+let hasNextPage = false;
+let requestId = 0;
+
+function getSettings() {
+  const [sort, direction] = dom.sort.value.split("_");
+
+  return {
+    proxyUrl: dom.proxyUrl.value.trim(),
+    collectionId: dom.collectionId.value.trim(),
+    perPage: Number(dom.pageSize.value),
+    sort,
+    direction
+  };
+}
+
+function getRequestUrl(settings, resource, page = 1) {
+  const url = new URL(settings.proxyUrl);
+  url.searchParams.set("resource", resource);
+  url.searchParams.set("collection", settings.collectionId);
+
+  if (resource === "pens") {
+    url.searchParams.set("page", String(page));
+    url.searchParams.set("per_page", String(settings.perPage));
+    url.searchParams.set("sort", settings.sort);
+    url.searchParams.set("direction", settings.direction);
+  }
+
+  return url;
+}
+
+async function request(settings, resource, page = 1) {
+  let response;
+
+  try {
+    response = await fetch(getRequestUrl(settings, resource, page), {
+      cache: "no-store"
+    });
+  } catch {
+    throw new Error("Could not reach the PHP proxy. Check its URL and CORS settings.");
+  }
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw new Error(data?.error || data?.message || `Request failed (${response.status})`);
+  }
+
+  if (!data) {
+    throw new Error("The response was not valid JSON");
+  }
+
+  return {
+    data,
+    link: response.headers.get("Link") ?? ""
+  };
+}
+
+function readPagination(link, page) {
+  const relations = {};
+
+  for (const match of link.matchAll(/<([^>]+)>;\s*rel="([^"]+)"/g)) {
+    relations[match[2]] = match[1];
+  }
+
+  const lastPage = relations.last
+    ? Number(new URL(relations.last).searchParams.get("page"))
+    : null;
+
+  return {
+    hasNext: Boolean(relations.next),
+    lastPage: Number.isInteger(lastPage) && lastPage >= page ? lastPage : null
+  };
+}
+
+function createPen(pen, index) {
+  const item = document.createElement("li");
+  item.className = "pen";
+
+  const media = document.createElement("a");
+  media.className = "pen-media";
+  media.href = pen.urls?.preview || pen.urls?.editor || "#";
+  media.target = "_blank";
+  media.rel = "noopener noreferrer";
+  media.setAttribute("aria-label", `Preview ${pen.title || "Untitled Pen"}`);
+
+  const placeholder = document.createElement("span");
+  placeholder.className = "pen-placeholder";
+  placeholder.textContent = "No screenshot";
+
+  if (pen.screenshot_urls?.medium) {
+    const image = document.createElement("img");
+    image.src = pen.screenshot_urls.medium;
+    image.alt = "";
+    image.loading = "lazy";
+    image.decoding = "async";
+    placeholder.hidden = true;
+
+    image.addEventListener("error", () => {
+      image.remove();
+      placeholder.hidden = false;
+    });
+
+    media.append(image);
+  }
+
+  media.append(placeholder);
+
+  const content = document.createElement("div");
+  content.className = "pen-content";
+
+  const number = document.createElement("span");
+  number.className = "pen-index";
+  number.textContent = String(index + 1).padStart(2, "0");
+
+  const heading = document.createElement("h3");
+  const headingLink = document.createElement("a");
+  headingLink.href = pen.urls?.editor || pen.urls?.preview || "#";
+  headingLink.target = "_blank";
+  headingLink.rel = "noopener noreferrer";
+  headingLink.textContent = pen.title || "Untitled Pen";
+  heading.append(headingLink);
+
+  content.append(number, heading);
+
+  if (pen.description) {
+    const description = document.createElement("p");
+    description.className = "pen-description";
+    description.textContent = pen.description;
+    content.append(description);
+  }
+
+  const meta = document.createElement("div");
+  meta.className = "pen-meta";
+
+  const editor = document.createElement("span");
+  editor.textContent = pen.editor === "V2" ? "CodePen 2.0" : "Classic";
+  meta.append(editor);
+
+  if (pen.updated_at) {
+    const date = new Date(pen.updated_at);
+
+    if (!Number.isNaN(date.getTime())) {
+      const time = document.createElement("time");
+      time.dateTime = pen.updated_at;
+      time.textContent = date.toLocaleDateString();
+      meta.append(time);
+    }
+  }
+
+  content.append(meta);
+
+  const preview = document.createElement("a");
+  preview.className = "pen-preview";
+  preview.href = pen.urls?.preview || pen.urls?.editor || "#";
+  preview.target = "_blank";
+  preview.rel = "noopener noreferrer";
+  preview.textContent = "Preview ↗";
+
+  item.append(media, content, preview);
+
+  return item;
+}
+
+function setBusy(busy) {
+  dom.load.disabled = busy;
+  dom.previous.disabled = busy || currentPage === 1;
+  dom.next.disabled = busy || !hasNextPage;
+  dom.sort.disabled = busy;
+  dom.pageSize.disabled = busy;
+}
+
+function renderPage(collection, pens, page, pagination) {
+  currentCollection = collection;
+  currentPage = page;
+  hasNextPage = pagination.hasNext;
+
+  dom.title.textContent = collection.title || "Untitled Collection";
+  dom.description.textContent = collection.description || "";
+  dom.count.textContent = `${pens.length} ${pens.length === 1 ? "Pen" : "Pens"} on this page`;
+  dom.status.textContent = "Loaded";
+  dom.collectionLink.hidden = !collection.url;
+
+  if (collection.url) {
+    dom.collectionLink.href = collection.url;
+  }
+
+  const fragment = document.createDocumentFragment();
+
+  pens.forEach((pen, index) => {
+    fragment.append(createPen(pen, (page - 1) * currentSettings.perPage + index));
+  });
+
+  dom.pens.replaceChildren(fragment);
+  dom.empty.hidden = pens.length !== 0;
+  dom.pageStatus.textContent = pagination.lastPage
+    ? `Page ${page} of ${pagination.lastPage}`
+    : `Page ${page}`;
+  dom.pagination.hidden = page === 1 && !hasNextPage;
+  dom.source.textContent = JSON.stringify({ collection, pens }, null, 2);
+}
+
+async function getPage(settings, page) {
+  const result = await request(settings, "pens", page);
+
+  if (!Array.isArray(result.data)) {
+    throw new Error("Unexpected Pens response");
+  }
+
+  return {
+    pens: result.data.filter(pen => pen?.access === "Public"),
+    pagination: readPagination(result.link, page)
+  };
+}
+
+async function loadCollection(settings) {
+  const currentRequest = ++requestId;
+
+  currentSettings = null;
+  currentCollection = null;
+  currentPage = 1;
+  hasNextPage = false;
+  setBusy(true);
+  dom.status.textContent = "Loading…";
+  dom.error.hidden = true;
+  dom.pens.replaceChildren();
+  dom.pagination.hidden = true;
+  dom.empty.hidden = true;
+  dom.collectionLink.hidden = true;
+  dom.title.textContent = "Collection";
+  dom.description.textContent = "";
+  dom.count.textContent = "No data loaded";
+  dom.source.textContent = "";
+
+  try {
+    const collectionResponse = await request(settings, "collection");
+    const collection = collectionResponse.data;
+
+    if (collection?.access !== "Public") {
+      throw new Error("This Collection is not public");
+    }
+
+    const result = await getPage(settings, 1);
+
+    if (currentRequest !== requestId) {
+      return;
+    }
+
+    currentSettings = settings;
+    renderPage(collection, result.pens, 1, result.pagination);
+  } catch (error) {
+    if (currentRequest !== requestId) {
+      return;
+    }
+
+    console.error(error);
+    dom.status.textContent = "Error";
+    dom.error.textContent = error.message;
+    dom.error.hidden = false;
+  } finally {
+    if (currentRequest === requestId) {
+      setBusy(false);
+    }
+  }
+}
+
+async function changePage(page) {
+  if (!currentSettings || !currentCollection || page < 1 || (page > currentPage && !hasNextPage)) {
+    return;
+  }
+
+  const currentRequest = ++requestId;
+
+  setBusy(true);
+  dom.status.textContent = "Loading…";
+  dom.error.hidden = true;
+
+  try {
+    const result = await getPage(currentSettings, page);
+
+    if (currentRequest !== requestId) {
+      return;
+    }
+
+    renderPage(currentCollection, result.pens, page, result.pagination);
+  } catch (error) {
+    if (currentRequest !== requestId) {
+      return;
+    }
+
+    console.error(error);
+    dom.status.textContent = "Error";
+    dom.error.textContent = error.message;
+    dom.error.hidden = false;
+  } finally {
+    if (currentRequest === requestId) {
+      setBusy(false);
+    }
+  }
+}
+
+dom.collectionId.value = CONFIG.collectionId;
+dom.proxyUrl.value = CONFIG.proxyUrl;
+dom.pageSize.value = String(CONFIG.perPage);
+
+dom.form.addEventListener("submit", event => {
+  event.preventDefault();
+  loadCollection(getSettings());
+});
+dom.sort.addEventListener("change", () => dom.form.requestSubmit());
+dom.pageSize.addEventListener("change", () => dom.form.requestSubmit());
+dom.previous.addEventListener("click", () => changePage(currentPage - 1));
+dom.next.addEventListener("click", () => changePage(currentPage + 1));
+
+loadCollection(getSettings());
